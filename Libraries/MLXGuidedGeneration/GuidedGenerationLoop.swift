@@ -78,6 +78,8 @@ public enum GuidedGenerationLoop {
     ///   - prefill: Prompt prefill parameters (step size, chunking strategy,
     ///     progress callback). Defaults to a 512-token step with balanced
     ///     chunking.
+    ///   - sampler: Selects each token from the grammar-masked, biased
+    ///     logits. `nil` (the default) keeps greedy `argMax` selection.
     ///   - emit: Callback for each text delta. Return `false` to stop.
     /// - Returns: Total number of tokens generated (including FF tokens).
     /// - Throws: `GuidedGenerationError.incompleteOutput` if maxTokens is
@@ -102,6 +104,7 @@ public enum GuidedGenerationLoop {
         whitespaceTokenIDs: Set<Int> = [],
         diagnosticLog: Bool = false,
         prefill: PrefillParameters = .init(stepSize: PrefillParameters.defaultStepSize),
+        sampler: (any LogitSampler)? = nil,
         emit: (String) -> Bool
     ) throws -> Int {
         let model = context.model
@@ -278,7 +281,8 @@ public enum GuidedGenerationLoop {
             let token = applyMaskAndSample(
                 logits: logits,
                 maskArray: maskArray,
-                closingBias: activeBias
+                closingBias: activeBias,
+                sampler: sampler
             )
             let tokenId = Int(token)
 
@@ -299,8 +303,8 @@ public enum GuidedGenerationLoop {
             // When `needsApply` IS true: if the grammar mask allowed
             // EOS (bit = 1), the grammar considers the output
             // acceptable. If the mask did NOT allow EOS,
-            // `applyMaskAndSample` set it to -inf, so argmax would not
-            // have selected it.
+            // `applyMaskAndSample` set it to -inf, so neither argmax nor a
+            // sampler would have selected it.
             if mask.needsApply {
                 if tokenId == context.tokenizer.unknownTokenId || stopTokenIDs.contains(tokenId) {
                     if diagnosticLog {
@@ -521,7 +525,8 @@ public enum GuidedGenerationLoop {
     static func applyMaskAndSample(
         logits rawLogits: MLXArray,
         maskArray: MLXArray?,
-        closingBias: MLXArray? = nil
+        closingBias: MLXArray? = nil,
+        sampler: (any LogitSampler)? = nil
     ) -> UInt32 {
         // Extract last-position logits: [batch, seq, vocab] -> [vocab]
         var logits = rawLogits[0..., -1, 0...]
@@ -547,9 +552,13 @@ public enum GuidedGenerationLoop {
             }
         }
 
-        // Grammar-constrained generation samples greedily by construction.
-        let sampled = argMax(logits, axis: -1)
-        return sampled.item(UInt32.self)
+        // Disallowed tokens are -inf here, so a sampler can never select
+        // them. Without a sampler, selection stays greedy.
+        guard let sampler else {
+            let sampled = argMax(logits, axis: -1)
+            return sampled.item(UInt32.self)
+        }
+        return sampler.sample(logits: logits).asType(.uint32).item(UInt32.self)
     }
 
     /// Build the additive grammar-mask array for a freshly computed `MaskResult`,
